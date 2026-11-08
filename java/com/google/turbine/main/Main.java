@@ -34,6 +34,7 @@ import com.google.turbine.binder.ClassPath;
 import com.google.turbine.binder.ClassPathBinder;
 import com.google.turbine.binder.CtSymClassBinder;
 import com.google.turbine.binder.JimageClassBinder;
+import com.google.turbine.binder.LazyClassPathBinder;
 import com.google.turbine.binder.Processing;
 import com.google.turbine.binder.ProcessorClassLoader;
 import com.google.turbine.binder.bound.SourceTypeBoundClass;
@@ -348,7 +349,9 @@ public final class Main {
     }
 
     // the bootclasspath might be empty, e.g. when compiling java.lang
-    return ClassPathBinder.bindClasspath(executor, toPaths(options.bootClassPath()));
+    ImmutableList<Path> bootClassPath = toPaths(options.bootClassPath());
+    ClassPath lazy = LazyClassPathBinder.bind(bootClassPath);
+    return lazy != null ? lazy : ClassPathBinder.bindClasspath(executor, bootClassPath);
   }
 
   private static ClassPath release(int release) throws IOException {
