@@ -27,14 +27,9 @@ import com.google.turbine.binder.bytecode.BytecodeBinder;
 import com.google.turbine.binder.bytecode.BytecodeBoundClass;
 import com.google.turbine.binder.env.Env;
 import com.google.turbine.binder.env.SimpleEnv;
-import com.google.turbine.binder.lookup.LookupKey;
-import com.google.turbine.binder.lookup.LookupResult;
-import com.google.turbine.binder.lookup.PackageScope;
-import com.google.turbine.binder.lookup.Scope;
 import com.google.turbine.binder.lookup.TopLevelIndex;
 import com.google.turbine.binder.sym.ClassSymbol;
 import com.google.turbine.binder.sym.ModuleSymbol;
-import com.google.turbine.tree.Tree.Ident;
 import com.google.turbine.zip.Zip;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -67,6 +62,7 @@ public final class LazyClassPathBinder {
   private static final byte[] SLASH_MODULE_INFO = bytes("/module-info.class");
   private static final byte[] TRANSITIVE_PREFIX = bytes(ClassPathBinder.TRANSITIVE_PREFIX);
   private static final String MANIFEST = "META-INF/MANIFEST.MF";
+  private static final Object MISSING = new Object();
   private static final Attributes.Name ORIGINAL_JAR_PATH = new Attributes.Name("Original-Jar-Path");
 
   /**
@@ -79,15 +75,15 @@ public final class LazyClassPathBinder {
     }
     Path path = paths.get(0);
     Zip.ZipIterable zip = new Zip.ZipIterable(path);
-    Zip.SortedIndex index = Zip.SortedIndex.create(zip);
-    if (index == null || hasTransitiveClasses(index)) {
+    Zip.Index index = Zip.Index.create(zip);
+    if (!index.isSorted() || hasTransitiveClasses(index)) {
       zip.close();
       return null;
     }
     return new LazyClassPath(path, index);
   }
 
-  private static boolean hasTransitiveClasses(Zip.SortedIndex index) {
+  private static boolean hasTransitiveClasses(Zip.Index index) {
     int i = index.lowerBound(TRANSITIVE_PREFIX);
     return i < index.size() && index.startsWith(i, TRANSITIVE_PREFIX);
   }
@@ -99,11 +95,16 @@ public final class LazyClassPathBinder {
   private static final class LazyClassPath implements ClassPath {
 
     private final Path path;
-    private final Zip.SortedIndex index;
+    private final Zip.Index index;
     private final int rootModuleInfo;
     private final Supplier<String> jarFile;
-    private final ConcurrentHashMap<ClassSymbol, BytecodeBoundClass> classes =
-        new ConcurrentHashMap<>();
+
+    /**
+     * The classes that have been looked up, including classes that don't exist (mapped to {@link
+     * #MISSING}), since the bootclasspath is looked up for every class.
+     */
+    private final ConcurrentHashMap<ClassSymbol, Object> classes = new ConcurrentHashMap<>(4096);
+
     private final Supplier<Env<ModuleSymbol, ModuleInfo>> moduleEnv;
     private final TopLevelIndex topLevelIndex = new Index();
 
@@ -111,21 +112,21 @@ public final class LazyClassPathBinder {
         new Env<ClassSymbol, BytecodeBoundClass>() {
           @Override
           public @Nullable BytecodeBoundClass get(ClassSymbol sym) {
-            BytecodeBoundClass result = classes.get(sym);
-            if (result != null) {
-              return result;
+            Object result = classes.get(sym);
+            if (result == null) {
+              int i = findClass(sym.binaryName());
+              Object info =
+                  i != -1 ? new BytecodeBoundClass(sym, index.entry(i), this, jarFile) : MISSING;
+              result = classes.putIfAbsent(sym, info);
+              if (result == null) {
+                result = info;
+              }
             }
-            int i = findClass(sym.binaryName());
-            if (i == -1) {
-              return null;
-            }
-            BytecodeBoundClass info = new BytecodeBoundClass(sym, index.entry(i), this, jarFile);
-            result = classes.putIfAbsent(sym, info);
-            return result != null ? result : info;
+            return result instanceof BytecodeBoundClass info ? info : null;
           }
         };
 
-    LazyClassPath(Path path, Zip.SortedIndex index) {
+    LazyClassPath(Path path, Zip.Index index) {
       this.path = path;
       this.index = index;
       this.rootModuleInfo = index.find(MODULE_INFO);
@@ -212,82 +213,26 @@ public final class LazyClassPathBinder {
       return i != -1 ? index.entry(i) : null;
     }
 
-    private final class Index implements TopLevelIndex {
-
-      private final Scope scope =
-          new Scope() {
-            @Override
-            public @Nullable LookupResult lookup(LookupKey lookupKey) {
-              ImmutableList<Ident> names = lookupKey.simpleNames();
-              StringBuilder prefix = new StringBuilder();
-              for (int i = 0; i < names.size(); i++) {
-                prefix.append(names.get(i).value());
-                String binaryName = prefix.toString();
-                if (findClass(binaryName) != -1) {
-                  // the remaining names are the ones after the class's simple name
-                  return new LookupResult(
-                      new ClassSymbol(binaryName), new LookupKey(names.subList(i, names.size())));
-                }
-                prefix.append('/');
-                if (!hasClassWithPrefix(bytes(prefix.toString()))) {
-                  return null;
-                }
-              }
-              return null;
-            }
-          };
+    private final class Index extends LazyTopLevelIndex {
 
       @Override
-      public Scope scope() {
-        return scope;
+      boolean hasClass(String binaryName) {
+        return findClass(binaryName) != -1;
       }
 
       @Override
-      public @Nullable PackageScope lookupPackage(Iterable<String> packageName) {
-        StringBuilder prefix = new StringBuilder();
-        for (String bit : packageName) {
-          if (bit.isEmpty()) {
-            throw new IllegalArgumentException("Empty package name");
-          }
-          prefix.append(bit);
-          // A class with the same name as a package shadows it, see the class javadoc.
-          if (findClass(prefix.toString()) != -1) {
-            return null;
-          }
-          prefix.append('/');
-          if (!hasClassWithPrefix(bytes(prefix.toString()))) {
-            return null;
-          }
-        }
-        return new LazyPackageScope(prefix.toString());
-      }
-    }
-
-    /** A package, identified by its binary name followed by {@code /}, or the empty string. */
-    private final class LazyPackageScope implements PackageScope {
-
-      private final String prefix;
-
-      LazyPackageScope(String prefix) {
-        this.prefix = prefix;
+      boolean hasPackage(String packageName) {
+        return hasClassWithPrefix(bytes(packageName + '/'));
       }
 
       @Override
-      public @Nullable LookupResult lookup(LookupKey lookupKey) {
-        String binaryName = prefix + lookupKey.first().value();
-        return findClass(binaryName) != -1
-            ? new LookupResult(new ClassSymbol(binaryName), lookupKey)
-            : null;
-      }
-
-      @Override
-      public Iterable<ClassSymbol> classes() {
-        byte[] prefixBytes = bytes(prefix);
+      Iterable<ClassSymbol> classes(String packageName) {
+        byte[] prefix = bytes(packageName.isEmpty() ? "" : packageName + '/');
         ImmutableList.Builder<ClassSymbol> result = ImmutableList.builder();
-        for (int i = index.lowerBound(prefixBytes);
-            i < index.size() && index.startsWith(i, prefixBytes);
+        for (int i = index.lowerBound(prefix);
+            i < index.size() && index.startsWith(i, prefix);
             i++) {
-          if (isClass(i) && index.indexOf(i, (byte) '/', prefixBytes.length) == -1) {
+          if (isClass(i) && index.indexOf(i, (byte) '/', prefix.length) == -1) {
             String name = index.name(i);
             result.add(new ClassSymbol(name.substring(0, name.length() - ".class".length())));
           }

@@ -400,47 +400,53 @@ public final class Zip {
   }
 
   /**
-   * An index of a zip archive whose central directory is strictly sorted by entry name, which
-   * supports looking up entries by name without decoding the names of all entries.
+   * An index of the entries of a zip archive by their position in the central directory, which
+   * supports inspecting entry names without decoding them. If the entries are sorted by name (see
+   * {@link #isSorted}), it also supports looking up entries by name.
    */
-  public static final class SortedIndex {
+  public static final class Index {
 
     private final ZipIterable zip;
 
-    /** The central directory offsets of all entries, in central directory (= name) order. */
+    /** The central directory offsets of all entries, in central directory order. */
     private final int[] offsets;
 
-    private SortedIndex(ZipIterable zip, int[] offsets) {
+    private Index(ZipIterable zip, int[] offsets) {
       this.zip = zip;
       this.offsets = offsets;
     }
 
-    /**
-     * Returns an index of the given archive, or {@code null} if the names of its entries aren't
-     * strictly increasing in the order of their UTF-8 bytes.
-     */
-    public static @Nullable SortedIndex create(ZipIterable zip) {
+    /** Returns an index of the given archive. */
+    public static Index create(ZipIterable zip) {
       ByteBuffer cd = zip.cd;
       int[] offsets = new int[1024];
       int count = 0;
-      int previous = -1;
       for (int cdindex = 0; cdindex < cd.limit(); ) {
         checkSignature(zip.path, cd, cdindex, 1, 2, "CENSIG");
-        if (previous != -1 && compareNames(cd, previous, cdindex) >= 0) {
-          return null;
-        }
         if (count == offsets.length) {
           offsets = Arrays.copyOf(offsets, count * 2);
         }
         offsets[count++] = cdindex;
-        previous = cdindex;
         cdindex +=
             CENHDR
                 + cd.getChar(cdindex + CENNAM)
                 + cd.getChar(cdindex + CENEXT)
                 + cd.getChar(cdindex + CENCOM);
       }
-      return new SortedIndex(zip, Arrays.copyOf(offsets, count));
+      return new Index(zip, Arrays.copyOf(offsets, count));
+    }
+
+    /**
+     * Returns true if the names of the entries are strictly increasing in the order of their UTF-8
+     * bytes, which is required by {@link #lowerBound} and {@link #find}.
+     */
+    public boolean isSorted() {
+      for (int i = 1; i < offsets.length; i++) {
+        if (compareNames(zip.cd, offsets[i - 1], offsets[i]) >= 0) {
+          return false;
+        }
+      }
+      return true;
     }
 
     private static int compareNames(ByteBuffer cd, int a, int b) {
@@ -463,7 +469,8 @@ public final class Zip {
       return offsets.length;
     }
 
-    private int nameLength(int i) {
+    /** The length of the UTF-8 encoded name of the {@code i}th entry. */
+    public int nameLength(int i) {
       return zip.cd.getChar(offsets[i] + CENNAM);
     }
 
@@ -554,9 +561,46 @@ public final class Zip {
       return -1;
     }
 
+    /**
+     * Returns the index of the last occurrence of {@code b} in the name of the {@code i}th entry,
+     * or {@code -1}.
+     */
+    public int lastIndexOf(int i, byte b) {
+      ByteBuffer cd = zip.cd;
+      int start = nameStart(i);
+      for (int j = nameLength(i) - 1; j >= 0; j--) {
+        if (cd.get(start + j) == b) {
+          return j;
+        }
+      }
+      return -1;
+    }
+
+    /**
+     * Returns true if the bytes {@code [from, from + length)} of the name of the {@code i}th entry
+     * are equal to the bytes {@code [otherFrom, otherFrom + length)} of the name of the {@code
+     * other}th entry.
+     */
+    public boolean regionEquals(int i, int from, int other, int otherFrom, int length) {
+      ByteBuffer cd = zip.cd;
+      int start = nameStart(i) + from;
+      int otherStart = nameStart(other) + otherFrom;
+      for (int j = 0; j < length; j++) {
+        if (cd.get(start + j) != cd.get(otherStart + j)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
     /** The name of the {@code i}th entry. */
     public String name(int i) {
       return ZipIterator.string(zip.cd, nameStart(i), nameLength(i));
+    }
+
+    /** The bytes {@code [from, to)} of the name of the {@code i}th entry, decoded as UTF-8. */
+    public String name(int i, int from, int to) {
+      return ZipIterator.string(zip.cd, nameStart(i) + from, to - from);
     }
 
     /** The {@code i}th entry. */
