@@ -586,4 +586,198 @@ public class TransitiveTest {
     ClassFile c = ClassReader.read(libc::toString, readJar(libc).get("c/C.class"));
     assertThat(getOnlyElement(c.fields()).descriptor()).isEqualTo("La/A$Inner;");
   }
+
+  private static ImmutableList<String> annotations(ClassFile cf) {
+    return cf.annotations().stream().map(a -> a.typeName()).collect(toImmutableList());
+  }
+
+  @Test
+  public void trimmedAnnotations() throws Exception {
+    Path libaHeader = temporaryFolder.newFolder().toPath().resolve("header.jar");
+    var _ =
+        runTurbine(
+            new SourceBuilder()
+                .addSourceLines(
+                    "a/Anno.java",
+                    """
+                    package a;
+                    import java.lang.annotation.*;
+                    @Documented
+                    @Retention(RetentionPolicy.RUNTIME)
+                    @Target({ElementType.TYPE, ElementType.FIELD, ElementType.PACKAGE})
+                    @Deprecated
+                    public @interface Anno {
+                      int value() default 0;
+                    }
+                    """)
+                .addSourceLines(
+                    "a/TypeAnno.java",
+                    """
+                    package a;
+                    import java.lang.annotation.*;
+                    @Retention(RetentionPolicy.RUNTIME)
+                    @Target(ElementType.TYPE_USE)
+                    public @interface TypeAnno {}
+                    """)
+                .addSourceLines(
+                    "a/package-info.java",
+                    """
+                    @Anno(1)
+                    package a;
+                    """)
+                .addSourceLines(
+                    "a/A.java",
+                    """
+                    package a;
+                    @Anno(2)
+                    @Deprecated
+                    public class A implements Comparable<@TypeAnno A> {
+                      @Anno(3) public static final int CONST = 42;
+                      public int compareTo(A other) {
+                        return 0;
+                      }
+                    }
+                    """)
+                .build(),
+            ImmutableList.of(),
+            Optional.of(libaHeader));
+
+    // Only the java.lang.annotation meta-annotations of annotation interfaces are kept.
+    Map<String, byte[]> header = readJar(libaHeader);
+    assertThat(annotations(ClassReader.read(libaHeader::toString, header.get("a/Anno.class"))))
+        .containsExactly(
+            "Ljava/lang/annotation/Documented;",
+            "Ljava/lang/annotation/Retention;",
+            "Ljava/lang/annotation/Target;")
+        .inOrder();
+    assertThat(
+            annotations(ClassReader.read(libaHeader::toString, header.get("a/package-info.class"))))
+        .isEmpty();
+    ClassFile a = ClassReader.read(libaHeader::toString, header.get("a/A.class"));
+    assertThat(annotations(a)).isEmpty();
+    assertThat(getOnlyElement(a.fields()).annotations()).isEmpty();
+    // Type annotations are kept, they are part of the supertype.
+    assertThat(getOnlyElement(a.typeAnnotations()).anno().typeName()).isEqualTo("La/TypeAnno;");
+
+    // Repackaged transitive classes are trimmed in the same way.
+    Path libb =
+        runTurbine(
+            new SourceBuilder()
+                .addSourceLines("b/B.java", "package b;", "public class B extends a.A {}")
+                .build(),
+            ImmutableList.of(libaHeader));
+    Map<String, byte[]> libbJar = readJar(libb);
+    assertThat(libbJar.keySet())
+        .containsAtLeast(
+            "META-INF/TRANSITIVE/a/A.turbine", "META-INF/TRANSITIVE/a/package-info.turbine");
+    ClassFile transitiveA =
+        ClassReader.read(libb::toString, libbJar.get("META-INF/TRANSITIVE/a/A.turbine"));
+    assertThat(annotations(transitiveA)).isEmpty();
+    assertThat(transitiveA.typeAnnotations()).hasSize(1);
+    assertThat(
+            annotations(
+                ClassReader.read(
+                    libb::toString, libbJar.get("META-INF/TRANSITIVE/a/package-info.turbine"))))
+        .isEmpty();
+  }
+
+  @Test
+  public void headerCompilationOutputAnnotations() throws Exception {
+    Path libaHeader = temporaryFolder.newFolder().toPath().resolve("header.jar");
+    Path liba =
+        runTurbine(
+            new SourceBuilder()
+                .addSourceLines(
+                    "a/Visible.java",
+                    """
+                    package a;
+                    import java.lang.annotation.*;
+                    @Retention(RetentionPolicy.RUNTIME)
+                    public @interface Visible {
+                      E e() default E.ONE;
+                    }
+                    """)
+                .addSourceLines(
+                    "a/E.java",
+                    """
+                    package a;
+                    public enum E { ONE, TWO }
+                    """)
+                .addSourceLines(
+                    "a/Decl.java",
+                    """
+                    package a;
+                    import java.lang.annotation.*;
+                    @Target({ElementType.TYPE_USE, ElementType.FIELD, ElementType.METHOD})
+                    @Repeatable(Decls.class)
+                    public @interface Decl {
+                      String value() default "";
+                    }
+                    """)
+                .addSourceLines(
+                    "a/Decls.java",
+                    """
+                    package a;
+                    import java.lang.annotation.*;
+                    @Target({ElementType.TYPE_USE, ElementType.FIELD, ElementType.METHOD})
+                    public @interface Decls {
+                      Decl[] value();
+                    }
+                    """)
+                .addSourceLines(
+                    "a/TypeAnno.java",
+                    """
+                    package a;
+                    import java.lang.annotation.*;
+                    @Retention(RetentionPolicy.RUNTIME)
+                    @Target(ElementType.TYPE_USE)
+                    public @interface TypeAnno {}
+                    """)
+                .addSourceLines(
+                    "a/A.java",
+                    """
+                    package a;
+                    @Visible(e = E.TWO)
+                    @Decl("a")
+                    public class A<T> {
+                      public class Inner {}
+                      @Decl("const") public static final int CONST = 1;
+                    }
+                    """)
+                .addSourceLines(
+                    "a/B.java",
+                    """
+                    package a;
+                    @Decl("b")
+                    public class B extends A<@TypeAnno String> {}
+                    """)
+                .build(),
+            ImmutableList.of(),
+            Optional.of(libaHeader));
+
+    ImmutableList<Path> sources =
+        new SourceBuilder()
+            .addSourceLines(
+                "c/C.java",
+                """
+                package c;
+                import a.*;
+                @Visible
+                public class C extends B {
+                  public Inner f;
+                  public java.util.List<Inner> g() {
+                    return null;
+                  }
+                  @Decl("x") @Decl("y") public static final int X = CONST + 1;
+                  @Visible(e = E.TWO) public @Decl int @TypeAnno [] arr;
+                }
+                """)
+            .build();
+
+    // Compiling against the trimmed header compilation output produces the same class files as
+    // compiling against the regular output.
+    Map<String, byte[]> expected = readJar(runTurbine(sources, ImmutableList.of(liba)));
+    Map<String, byte[]> actual = readJar(runTurbine(sources, ImmutableList.of(libaHeader)));
+    assertThat(actual.get("c/C.class")).isEqualTo(expected.get("c/C.class"));
+  }
 }

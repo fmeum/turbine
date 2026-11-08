@@ -27,12 +27,14 @@ import com.google.turbine.binder.env.Env;
 import com.google.turbine.binder.env.SimpleEnv;
 import com.google.turbine.binder.sym.ClassSymbol;
 import com.google.turbine.bytecode.ClassFile;
+import com.google.turbine.bytecode.ClassFile.AnnotationInfo;
 import com.google.turbine.bytecode.ClassFile.FieldInfo;
 import com.google.turbine.bytecode.ClassFile.InnerClass;
 import com.google.turbine.bytecode.ClassWriter;
 import com.google.turbine.model.TurbineFlag;
 import com.google.turbine.parallel.TurbineExecutor;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import org.jspecify.annotations.Nullable;
 
@@ -81,11 +83,20 @@ public final class Transitive {
    * Removes information from repackaged classes that will not be needed by upstream compilations.
    */
   public static ClassFile trimClass(ClassFile cf, @Nullable String jarFile) {
-    // drop non-constant fields
+    boolean isAnnotation = (cf.access() & TurbineFlag.ACC_ANNOTATION) == TurbineFlag.ACC_ANNOTATION;
+    // drop non-constant fields, and the declaration annotations of the remaining fields
     ImmutableList.Builder<FieldInfo> fields = ImmutableList.builder();
     for (FieldInfo f : cf.fields()) {
       if (keepField(f)) {
-        fields.add(f);
+        fields.add(
+            new FieldInfo(
+                f.access(),
+                f.name(),
+                f.descriptor(),
+                f.signature(),
+                f.value(),
+                /* annotations= */ ImmutableList.of(),
+                f.typeAnnotations()));
       }
     }
     // Remove InnerClass attributes that are unnecessary after pruning the types they refer to.
@@ -114,20 +125,37 @@ public final class Transitive {
         cf.interfaces(),
         cf.permits(),
         // drop methods, except for annotations where we need to resolve key/value information
-        (cf.access() & TurbineFlag.ACC_ANNOTATION) == TurbineFlag.ACC_ANNOTATION
-            ? cf.methods()
-            : ImmutableList.of(),
+        isAnnotation ? cf.methods() : ImmutableList.of(),
         fields.build(),
-        // class annotations are kept as-is, e.g. downstream compilations need @interface
-        // meta-annotations like @Retention and @Target
-        cf.annotations(),
+        // Of the declaration annotations on classes, downstream header compilations only read the
+        // meta-annotations of annotation interfaces, e.g. @Retention, @Target, and @Repeatable.
+        // Dropping all other declaration annotations (including package annotations in
+        // package-infos) means that changing them doesn't change the trimmed class files, and
+        // doesn't invalidate downstream header compilations.
+        isAnnotation ? metaAnnotations(cf.annotations()) : ImmutableList.of(),
         innerClasses.build(),
+        // Type annotations are kept, since they are part of the supertypes and type parameter
+        // bounds that downstream compilations see, e.g. when canonicalizing an inherited member
+        // type of `class B extends A<@TA String>`.
         cf.typeAnnotations(),
         /* module= */ null,
         /* nestHost= */ null,
         /* nestMembers= */ ImmutableList.of(),
         /* record= */ null,
         /* transitiveJar= */ transitiveJar);
+  }
+
+  /** Returns the annotations from the {@code java.lang.annotation} package. */
+  private static ImmutableList<AnnotationInfo> metaAnnotations(List<AnnotationInfo> annotations) {
+    ImmutableList.Builder<AnnotationInfo> result = ImmutableList.builder();
+    for (AnnotationInfo annotation : annotations) {
+      String typeName = annotation.typeName();
+      if (typeName.startsWith("Ljava/lang/annotation/")
+          && typeName.indexOf('/', "Ljava/lang/annotation/".length()) == -1) {
+        result.add(annotation);
+      }
+    }
+    return result.build();
   }
 
   private static boolean keepField(FieldInfo f) {
